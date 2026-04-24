@@ -9,83 +9,78 @@ from shapely.ops import transform
 import folium
 from streamlit_folium import st_folium
 
-st.set_page_config(page_title="Geo-Detic Pro", layout="wide")
+st.set_page_config(page_title="Geo-Expert Pro v3", layout="wide")
 
-# --- FONCTION DE RECHERCHE DE COMMUNE (Comme en HTML) ---
+# --- RECHERCHE COMMUNE ---
 def get_target_epsg_from_city(city_name):
     try:
         url = f"https://nominatim.openstreetmap.org/search?format=json&q={city_name}&limit=1"
         response = requests.get(url, headers={'User-Agent': 'GeoAuditApp/1.0'})
         data = response.json()
         if data:
-            lon = float(data[0]['lon'])
-            lat = float(data[0]['lat'])
+            lon, lat = float(data[0]['lon']), float(data[0]['lat'])
             display_name = data[0]['display_name']
-            
-            # Logique d'incrémentation automatique
             if "France" in display_name:
                 return "EPSG:2154", display_name
-            else:
-                utm_zone = int((lon + 180) / 6) + 1
-                epsg = (32600 if lat >= 0 else 32700) + utm_zone
-                return f"EPSG:{epsg}", display_name
-    except Exception as e:
-        return "EPSG:4326", f"Erreur recherche : {e}"
-    return "EPSG:4326", "Non trouvé (WGS84 par défaut)"
+            utm_zone = int((lon + 180) / 6) + 1
+            epsg = (32600 if lat >= 0 else 32700) + utm_zone
+            return f"EPSG:{epsg}", display_name
+    except: pass
+    return "EPSG:4326", "WGS84 par défaut"
 
-# --- LOGIQUE D'AUDIT ---
-def analyze_coherence(src, target_epsg_code):
+# --- LOGIQUE D'AUDIT & MÉTADONNÉES ---
+def analyze_full(src, target_epsg_code):
     issues = []
     score = 100
     
-    # 1. Correction de la détection EPSG Entrée
+    # 1. Extraction CRS
     try:
-        # On force la lecture du CRS depuis le fichier
         source_crs = CRS.from_user_input(src.crs)
-        detected_epsg = f"EPSG:{source_crs.to_epsg()}" if source_crs.to_epsg() else source_crs.to_string()
-    except Exception:
+        detected_epsg = f"EPSG:{source_crs.to_epsg()}" if source_crs.to_epsg() else "Personnalisé"
+    except:
         source_crs = CRS.from_user_input("EPSG:4326")
-        detected_epsg = "Inconnu (WGS84 par défaut)"
+        detected_epsg = "Inconnu (WGS84 assumé)"
         score -= 20
-        issues.append("Axe 0 : Impossible de lire le système d'origine (.prj manquant ?)")
+        issues.append("Métadonnées de projection absentes.")
 
-    # 2. Analyse spatiale
+    # 2. Analyse Spatiale
     b = src.bounds
     cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
     
-    # Axe 1 : Cohérence métrique
-    if source_crs.is_geographic and (abs(cx) > 180 or abs(cy) > 90):
-        score -= 40
-        issues.append("Axe 1 : Les coordonnées sont métriques mais le système est en Degrés.")
+    # 3. Métadonnées Techniques
+    metadata = {
+        "Format (Driver)": src.driver,
+        "Type de Géométrie": src.schema['geometry'],
+        "Nombre d'entités": len(src),
+        "Colonnes (Attributs)": ", ".join(list(src.schema['properties'].keys())),
+        "Emprise Ouest": round(b[0], 2),
+        "Emprise Sud": round(b[1], 2),
+        "Emprise Est": round(b[2], 2),
+        "Emprise Nord": round(b[3], 2),
+    }
 
-    # Axe 3 : Cohérence topologique
+    # 4. Vérification Dérive (Axe 3)
     try:
         transformer_to_wgs = Transformer.from_crs(source_crs, "EPSG:4326", always_xy=True)
         lon_c, lat_c = transformer_to_wgs.transform(cx, cy)
-        
         if target_epsg_code == "EPSG:2154" and not (41 < lat_c < 52 and -5 < lon_c < 10):
             score -= 30
-            issues.append(f"Axe 3 : Décalage. Données situées vers {lat_c:.2f}, {lon_c:.2f}")
-    except:
-        lat_c, lon_c = 0, 0
+            issues.append(f"Décalage spatial détecté ({lat_c:.2f}, {lon_c:.2f}).")
+    except: lat_c, lon_c = 0, 0
 
-    return score, issues, detected_epsg, (lat_c, lon_c), source_crs
+    return score, issues, detected_epsg, (lat_c, lon_c), source_crs, metadata
 
 # --- INTERFACE ---
-st.title("🌍 Geo-Detic : Conversion de projection")
+st.title("🌍 Geo-Expert : Audit & Rapport Métadonnées")
 
 col1, col2 = st.columns([1, 1])
 
 with col1:
-    st.subheader("1. Paramètres")
-    city_input = st.text_input("Tapez une commune (incrémente l'EPSG cible)", "Saint-Lô, France")
-    
-    # Automatisation de l'EPSG cible
+    st.subheader("⚙️ Configuration")
+    city_input = st.text_input("Commune du projet", "Saint-Lô, France")
     auto_epsg, full_name = get_target_epsg_from_city(city_input)
-    st.info(f"📍 Cible détectée : **{auto_epsg}**\n({full_name})")
-    
-    # On laisse quand même le choix à l'utilisateur si besoin
-    target_epsg = st.text_input("Confirmer l'EPSG cible", value=auto_epsg)
+    target_epsg = st.text_input("EPSG Cible", value=auto_epsg)
+    st.caption(f"Localisation : {full_name}")
 
     uploaded_file = st.file_uploader("Fichier (.gpkg ou .zip)", type=["gpkg", "zip"])
 
@@ -98,27 +93,41 @@ if uploaded_file:
 
     try:
         with fiona.open(vfs_path) as src:
-            score, issues, det_epsg, center, final_src_crs = analyze_coherence(src, target_epsg)
+            score, issues, det_epsg, center, f_src_crs, meta = analyze_full(src, target_epsg)
             
             with col2:
-                st.subheader("2. Rapport d'Audit")
+                st.subheader("📊 Diagnostic")
                 st.metric("Score de fiabilité", f"{score}%")
-                st.write(f"**EPSG Source détecté :** `{det_epsg}`")
                 
-                for issue in issues:
-                    st.error(issue)
-                
+                # Liste des problèmes
+                if issues:
+                    for i in issues: st.warning(i)
+                else: st.success("Données cohérentes.")
+
                 # Carte
                 m = folium.Map(location=[center[0], center[1]], zoom_start=12)
-                folium.Marker([center[0], center[1]], popup="Emplacement des données").add_to(m)
-                st_folium(m, height=300, width=None)
+                folium.Marker([center[0], center[1]], popup="Centroïde").add_to(m)
+                st_folium(m, height=250, width=None)
+
+            # --- RAPPORT DE MÉTADONNÉES ---
+            st.divider()
+            with st.expander("📝 Voir le rapport détaillé des métadonnées"):
+                c_m1, c_m2 = st.columns(2)
+                items = list(meta.items())
+                half = len(items) // 2
+                
+                with c_m1:
+                    for k, v in items[:half]: st.write(f"**{k} :** {v}")
+                    st.write(f"**CRS Source :** `{det_epsg}`")
+                with c_m2:
+                    for k, v in items[half:]: st.write(f"**{k} :** {v}")
+                    st.write(f"**Centroïde WGS84 :** `{round(center[0],4)}, {round(center[1],4)}`")
 
             # --- CONVERSION ---
-            st.divider()
-            if st.button("🛠️ Lancer la conversion en GeoPackage"):
-                out_path = os.path.join(tempfile.gettempdir(), f"output_{target_epsg.replace(':','_')}.gpkg")
+            if st.button("🛠️ Convertir en GeoPackage"):
+                out_path = os.path.join(tempfile.gettempdir(), "converted.gpkg")
                 dst_crs = CRS.from_user_input(target_epsg)
-                transformer = Transformer.from_crs(final_src_crs, dst_crs, always_xy=True)
+                transformer = Transformer.from_crs(f_src_crs, dst_crs, always_xy=True)
                 
                 with fiona.open(out_path, 'w', driver='GPKG', crs=dst_crs, schema=src.schema.copy()) as dst:
                     for feat in src:
@@ -126,9 +135,8 @@ if uploaded_file:
                         dst.write({'geometry': new_geom.__geo_interface__, 'properties': feat['properties']})
                 
                 with open(out_path, "rb") as f:
-                    st.download_button("💾 Télécharger le GPKG corrigé", f, file_name=f"export_{target_epsg}.gpkg")
+                    st.download_button("💾 Télécharger le GPKG", f, file_name=f"export_{target_epsg}.gpkg")
 
-    except Exception as e:
-        st.error(f"Erreur Fiona : {e}")
+    except Exception as e: st.error(f"Erreur : {e}")
     finally:
         if os.path.exists(tmp_path): os.unlink(tmp_path)
