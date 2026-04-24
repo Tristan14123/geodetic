@@ -1,0 +1,6 @@
+streamlit
+fiona
+pyproj
+shapely
+folium
+streamlit-folium
