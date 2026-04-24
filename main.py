@@ -1,105 +1,102 @@
-import os, shutil, tempfile, uuid
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+import streamlit as st
 import fiona
+import os
+import tempfile
 from pyproj import CRS, Transformer
 from shapely.geometry import shape
 from shapely.ops import transform
+import folium
+from streamlit_folium import st_folium
 
-app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+st.set_page_config(page_title="Geo-Expert Diagnostic", layout="wide")
 
-TEMP_DIR = tempfile.gettempdir()
-
-def get_fiona_path(temp_path):
-    return f"zip://{temp_path}" if temp_path.lower().endswith('.zip') else temp_path
-
+# --- LOGIQUE MÉTIER ---
 def analyze_coherence(src, target_epsg_code):
     issues = []
     score = 100
-    
-    # Tentative d'extraction CRS
     try:
         declared_crs = CRS.from_user_input(src.crs if src.crs else "EPSG:4326")
-        epsg_str = f"EPSG:{declared_crs.to_epsg()}" if declared_crs.to_epsg() else "Inconnu (Défini par texte)"
+        epsg_str = f"EPSG:{declared_crs.to_epsg()}" if declared_crs.to_epsg() else "Inconnu"
     except:
         declared_crs = CRS.from_user_input("EPSG:4326")
-        epsg_str = "Non défini (WGS84 par défaut)"
+        epsg_str = "WGS84 (Défaut)"
         score -= 20
-        issues.append("Axe 0 : Absence de métadonnées de projection (.prj manquant).")
+        issues.append("Axe 0 : Métadonnées de projection absentes.")
 
-    # Calcul du centroïde
     b = src.bounds
     cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
     
-    # Analyse Métrique (Axe 1)
+    # Axe 1 : Métrique
     if declared_crs.is_geographic and (abs(cx) > 180 or abs(cy) > 90):
         score -= 40
-        issues.append("Axe 1 : Coordonnées métriques détectées dans un système géographique.")
+        issues.append("Axe 1 : Coordonnées métriques dans un système géographique.")
 
-    # Analyse Topologique (Axe 3)
-    try:
-        trans = Transformer.from_crs(declared_crs, "EPSG:4326", always_xy=True)
-        lon, lat = trans.transform(cx, cy)
-        if target_epsg_code == "EPSG:2154" and not (41 < lat < 52 and -5 < lon < 10):
-            score -= 30
-            issues.append(f"Axe 3 : Décalage spatial majeur (Localisé à {lat:.2f}, {lon:.2f}).")
-    except: pass
+    # Axe 3 : Topologie
+    trans = Transformer.from_crs(declared_crs, "EPSG:4326", always_xy=True)
+    lon, lat = trans.transform(cx, cy)
+    if target_epsg_code == "EPSG:2154" and not (41 < lat < 52 and -5 < lon < 10):
+        score -= 30
+        issues.append(f"Axe 3 : Décalage spatial (Localisé à {lat:.2f}, {lon:.2f}).")
 
-    metadata = {
-        "driver": src.driver,
-        "schema": src.schema['geometry'],
-        "crs_name": declared_crs.name,
-        "is_metric": not declared_crs.is_geographic,
-        "bounds": {"min_x": b[0], "min_y": b[1], "max_x": b[2], "max_y": b[3]},
-        "center_wgs84": {"lat": lat if 'lat' in locals() else None, "lon": lon if 'lon' in locals() else None}
-    }
+    return score, issues, epsg_str, (lat, lon)
+
+# --- INTERFACE STREAMLIT ---
+st.title("🔍 Geo-Expert : Audit & Conversion")
+
+col1, col2 = st.columns([1, 1])
+
+with col1:
+    st.subheader("1. Configuration")
+    target_city = st.text_input("Commune cible", "Saint-Lô, France")
+    # Pour l'exemple on simplifie le choix EPSG (tu peux garder ta logique Nominatim ici)
+    target_epsg = st.selectbox("Système cible", ["EPSG:2154", "EPSG:4326", "EPSG:3857"], index=0)
+
+    uploaded_file = st.file_uploader("Charger un GeoPackage ou Shapefile (ZIP)", type=["gpkg", "zip"])
+
+if uploaded_file:
+    # Sauvegarde temporaire pour Fiona
+    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as tmp:
+        tmp.write(uploaded_file.getvalue())
+        tmp_path = tmp.name
     
-    return score, issues, epsg_str, metadata
+    vfs_path = f"zip://{tmp_path}" if tmp_path.endswith('.zip') else tmp_path
 
-@app.post("/audit")
-async def audit_file(file: UploadFile = File(...), target_epsg: str = Form(...)):
-    suffix = os.path.splitext(file.filename)[1]
-    path = os.path.join(TEMP_DIR, f"audit_{uuid.uuid4()}{suffix}")
-    with open(path, "wb") as f: shutil.copyfileobj(file.file, f)
     try:
-        with fiona.open(get_fiona_path(path)) as src:
-            score, issues, epsg, meta = analyze_coherence(src, target_epsg)
-            return {
-                "status": "success",
-                "filename": file.filename,
-                "detected_epsg": epsg,
-                "confidence_score": max(0, score),
-                "issues": issues,
-                "feature_count": len(src),
-                "metadata": meta
-            }
-    except Exception as e: return {"status": "error", "message": str(e)}
-    finally:
-        if os.path.exists(path): os.unlink(path)
+        with fiona.open(vfs_path) as src:
+            score, issues, detected_epsg, center = analyze_coherence(src, target_epsg)
+            
+            with col2:
+                st.subheader("2. Diagnostic")
+                st.metric("Score de fiabilité", f"{score}%")
+                st.progress(score / 100)
+                
+                for issue in issues:
+                    st.error(issue)
+                if not issues:
+                    st.success("✅ Aucune anomalie majeure détectée.")
 
-@app.post("/convert")
-async def convert_file(file: UploadFile = File(...), target_epsg: str = Form(...)):
-    suffix = os.path.splitext(file.filename)[1]
-    in_path = os.path.join(TEMP_DIR, f"in_{uuid.uuid4()}{suffix}")
-    out_name = f"reprojected_{target_epsg.replace(':', '_')}.gpkg"
-    out_path = os.path.join(TEMP_DIR, out_name)
-    with open(in_path, "wb") as f: shutil.copyfileobj(file.file, f)
-    try:
-        with fiona.open(get_fiona_path(in_path)) as src:
-            source_crs = src.crs
-            dest_crs = CRS.from_user_input(target_epsg)
-            transformer = Transformer.from_crs(source_crs, dest_crs, always_xy=True)
-            with fiona.open(out_path, 'w', driver='GPKG', crs=dest_crs, schema=src.schema.copy()) as dst:
-                for feat in src:
-                    new_geom = transform(transformer.transform, shape(feat['geometry']))
-                    dst.write({'geometry': new_geom.__geo_interface__, 'properties': feat['properties']})
-        return FileResponse(path=out_path, filename=out_name)
-    except Exception as e: return {"status": "error", "message": str(e)}
-    finally:
-        if os.path.exists(in_path): os.unlink(in_path)
+                # Affichage de la carte
+                m = folium.Map(location=[center[0], center[1]], zoom_start=12)
+                folium.Marker([center[0], center[1]], popup=f"Centroïde: {detected_epsg}").add_to(m)
+                st_folium(m, height=300, width=None)
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+            # --- CONVERSION ---
+            st.divider()
+            if st.button("🚀 Convertir et Télécharger en GPKG"):
+                out_path = os.path.join(tempfile.gettempdir(), "converted.gpkg")
+                dest_crs = CRS.from_user_input(target_epsg)
+                transformer = Transformer.from_crs(src.crs, dest_crs, always_xy=True)
+                
+                with fiona.open(out_path, 'w', driver='GPKG', crs=dest_crs, schema=src.schema.copy()) as dst:
+                    for feat in src:
+                        new_geom = transform(transformer.transform, shape(feat['geometry']))
+                        dst.write({'geometry': new_geom.__geo_interface__, 'properties': feat['properties']})
+                
+                with open(out_path, "rb") as f:
+                    st.download_button("💾 Télécharger le fichier .gpkg", f, file_name=f"converted_{target_epsg}.gpkg")
+
+    except Exception as e:
+        st.error(f"Erreur de lecture : {e}")
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
