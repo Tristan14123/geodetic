@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <title>Geo-Diagnostic Expert + Map</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        :root { --blue: #2563eb; --green: #16a34a; --red: #dc2626; --bg: #f8fafc; }
+        body { font-family: 'Inter', sans-serif; background: var(--bg); padding: 20px; color: #1e293b; }
+        .card { max-width: 900px; margin: auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); }
+        #drop-zone { border: 2px dashed #cbd5e1; padding: 30px; text-align: center; border-radius: 8px; cursor: pointer; margin-bottom: 20px; }
+        #map { height: 300px; width: 100%; border-radius: 8px; margin-top: 15px; border: 1px solid #cbd5e1; display: none; }
+        .meta-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-top: 15px; }
+        .meta-item { background: #f1f5f9; padding: 10px; border-radius: 6px; font-size: 0.85rem; }
+        .score-bar { height: 8px; background: #e2e8f0; border-radius: 4px; margin: 10px 0; overflow: hidden; }
+        .score-fill { height: 100%; transition: 0.8s ease-out; width: 0; }
+        .btn { width: 100%; padding: 12px; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; margin-top: 20px; background: var(--green); color: white; display: none; }
+    </style>
+</head>
+<body>
+
+<div class="card">
+    <h2 style="margin-top:0">🔍 Geo-Detic : Audit & Visualisation</h2>
+    
+    <div style="margin-bottom:20px">
+        <input type="text" id="city" placeholder="Commune cible (ex: Saint-Lô)" style="width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px;">
+        <div id="targetInfo" style="font-size:0.8rem; color:var(--blue); margin-top:5px"></div>
+    </div>
+
+    <div id="drop-zone">Glissez votre GeoPackage ou ZIP ici</div>
+    <input type="file" id="fileInput" hidden>
+
+    <div id="auditResult" style="display:none">
+        <div style="display:flex; justify-content:space-between">
+            <b>Score de fiabilité : <span id="scoreText">0%</span></b>
+            <span id="m-crs" style="font-size:0.85rem; font-weight:bold"></span>
+        </div>
+        <div class="score-bar"><div id="scoreFill" class="score-fill"></div></div>
+        
+        <div id="issuesList" style="margin-bottom:15px"></div>
+
+        <div id="map"></div>
+
+        <div class="meta-grid">
+            <div class="meta-item">🔢 <b>Entités :</b> <span id="m-count">-</span></div>
+            <div class="meta-item">📐 <b>Type :</b> <span id="m-geom">-</span></div>
+        </div>
+
+        <button id="convertBtn" class="btn">GÉNÉRER LE GEOPACKAGE PROJETÉ</button>
+    </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+    let currentFile = null, targetEpsg = "EPSG:4326", map, marker;
+
+    // Initialisation de la carte (cachée au début)
+    function initMap(lat, lon) {
+        const mapDiv = document.getElementById('map');
+        mapDiv.style.display = 'block';
+        if (!map) {
+            map = L.map('map').setView([lat, lon], 12);
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                attribution: '© OSM'
+            }).addTo(map);
+            marker = L.marker([lat, lon]).addTo(map);
+        } else {
+            map.setView([lat, lon], 12);
+            marker.setLatLng([lat, lon]);
+        }
+        map.invalidateSize(); // Force le rafraîchissement du rendu
+    }
+
+    // Recherche de ville
+    document.getElementById('city').addEventListener('change', async (e) => {
+        const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(e.target.value)}&limit=1`);
+        const data = await res.json();
+        if(data[0]) {
+            const lon = parseFloat(data[0].lon), lat = parseFloat(data[0].lat);
+            const utm = Math.floor((lon + 180) / 6) + 1;
+            targetEpsg = data[0].display_name.includes("France") ? "EPSG:2154" : `EPSG:${(lat >= 0 ? 32600 : 32700) + utm}`;
+            document.getElementById('targetInfo').innerText = `Cible : ${targetEpsg}`;
+        }
+    });
+
+    // Upload & Audit
+    const dz = document.getElementById('drop-zone'), fi = document.getElementById('fileInput');
+    dz.onclick = () => fi.click();
+    fi.onchange = async (e) => {
+        currentFile = e.target.files[0];
+        const fd = new FormData(); fd.append("file", currentFile); fd.append("target_epsg", targetEpsg);
+        
+        dz.innerText = "Analyse en cours...";
+        const response = await fetch("http://127.0.0.1:8000/audit", { method: "POST", body: fd });
+        const res = await response.json();
+        dz.innerText = "Fichier : " + currentFile.name;
+        
+        if(res.status === "success") renderAudit(res);
+    };
+
+    function renderAudit(res) {
+        document.getElementById('auditResult').style.display = 'block';
+        const score = res.confidence_score;
+        document.getElementById('scoreText').innerText = score + "%";
+        const fill = document.getElementById('scoreFill');
+        fill.style.width = score + "%";
+        fill.style.background = score > 70 ? 'var(--green)' : (score > 40 ? '#f59e0b' : 'var(--red)');
+        
+        document.getElementById('m-crs').innerText = res.detected_epsg;
+        document.getElementById('m-count').innerText = res.feature_count;
+        document.getElementById('m-geom').innerText = res.metadata.schema;
+
+        const issuesDiv = document.getElementById('issuesList');
+        issuesDiv.innerHTML = res.issues.map(i => `<div style="color:var(--red); font-size:0.85rem">⚠️ ${i}</div>`).join('');
+
+        // Affichage sur la carte si les coordonnées WGS84 sont valides
+        if (res.metadata.center_wgs84.lat) {
+            initMap(res.metadata.center_wgs84.lat, res.metadata.center_wgs84.lon);
+            marker.bindPopup(`<b>Emprise du fichier</b><br>EPSG: ${res.detected_epsg}`).openPopup();
+        }
+
+        document.getElementById('convertBtn').style.display = 'block';
+        document.getElementById('convertBtn').onclick = () => runConvert();
+    }
+
+    async function runConvert() {
+        const btn = document.getElementById('convertBtn');
+        btn.innerText = "Conversion...";
+        const fd = new FormData(); fd.append("file", currentFile); fd.append("target_epsg", targetEpsg);
+        const response = await fetch("http://127.0.0.1:8000/convert", { method: "POST", body: fd });
+        const blob = await response.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a'); a.href = url; a.download = `converted_${targetEpsg.replace(':','_')}.gpkg`; a.click();
+        btn.innerText = "GÉNÉRER LE GEOPACKAGE PROJETÉ";
+    }
+</script>
+</body>
+</html>
