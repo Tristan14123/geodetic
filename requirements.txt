@@ -4,3 +4,4 @@ pyproj
 shapely
 folium
 streamlit-folium
+requests
