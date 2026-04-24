@@ -9,7 +9,7 @@ from shapely.ops import transform
 import folium
 from streamlit_folium import st_folium
 
-st.set_page_config(page_title="Geo-Expert Pro", layout="wide")
+st.set_page_config(page_title="Geo-Detic Pro", layout="wide")
 
 # --- FONCTION DE RECHERCHE DE COMMUNE (Comme en HTML) ---
 def get_target_epsg_from_city(city_name):
@@ -72,7 +72,7 @@ def analyze_coherence(src, target_epsg_code):
     return score, issues, detected_epsg, (lat_c, lon_c), source_crs
 
 # --- INTERFACE ---
-st.title("🌍 Geo-Expert : Audit & Conversion Automatisée")
+st.title("🌍 Geo-Detic : Conversion de projection")
 
 col1, col2 = st.columns([1, 1])
 
